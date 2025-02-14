@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+import json
+import csv
+import os
+import sys
+from enum import Enum, auto
+import torch
+from hyperpyyaml import load_hyperpyyaml
+from torch.utils.data import DataLoader
+from tqdm.contrib import tqdm
+import speechbrain as sb
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import f1_score
+from transformers import WavLMModel
+
+class EmoIdBrain(sb.Brain):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        #---------------------------
+        scratch_dir = os.path.join(os.environ['SCRATCH'], 'wavlm-large')
+
+        self.wavlm_model = WavLMModel.from_pretrained(scratch_dir)
+        #self.wavlm_model = WavLMModel.from_pretrained("./wavlm-base-plus")
+
+        self.wavlm_model.eval()  # Set the model to evaluation mode
+        self.wavlm_model.to(self.device)  # Move the model to GPU
+        #-------------------------
+        self.train_losses = []
+        self.test_losses = []
+        self.predictions = []
+        self.true_labels = []
+        self.genders = []
+
+    def compute_forward(self, batch, stage):
+        batch = batch.to(self.device)
+        wavs, lens = batch.sig
+        # Process audio with WavLM
+        with torch.no_grad():
+            # Ensure the input is float and normalized
+            wavs = wavs.float()
+            wavs = torch.nn.functional.layer_norm(wavs, wavs.shape)
+
+            # WavLM expects input shape (batch_size, sequence_length)
+            if len(wavs.shape) == 3:
+                wavs = wavs.squeeze(1)
+
+            outputs = self.wavlm_model(wavs)
+            feats = outputs.last_hidden_state
+
+        # The rest of your forward pass remains the same
+        embeddings = self.modules.embedding_model(feats, lens)
+        outputs = self.modules.classifier(embeddings)
+        outputs = torch.nn.functional.log_softmax(outputs, dim=-1)
+
+        return outputs
+
+    def compute_objectives(self, predictions, batch, stage):
+        _, lens = batch.sig
+        labels, _ = batch.label_encoded
+        if stage == sb.Stage.TRAIN:
+            if hasattr(self.hparams.lr_annealing, "on_batch_end"):
+                self.hparams.lr_annealing.on_batch_end(self.optimizer)
+
+        loss = self.hparams.compute_cost(predictions, labels, lens)
+
+        if stage != sb.Stage.TRAIN:
+            self.error_metrics.append(batch.id, predictions, labels, lens)
+            self.predictions.extend(predictions.argmax(dim=-1).cpu().numpy())
+            self.true_labels.extend(labels.cpu().numpy())
+            self.genders.extend(batch.gender)
+
+        return loss
+
+    def on_stage_start(self, stage, epoch=None):
+        self.loss_metric = sb.utils.metric_stats.MetricStats(
+            metric=sb.nnet.losses.nll_loss
+        )
+        if stage != sb.Stage.TRAIN:
+            self.error_metrics = self.hparams.error_stats()
+            self.predictions = []
+            self.true_labels = []
+            self.genders = []
+
+    def on_stage_end(self, stage, stage_loss, epoch=None):
+        if stage == sb.Stage.TRAIN:
+            self.train_losses.append(stage_loss)
+            self.train_loss = stage_loss
+        else:
+            f1 = f1_score(self.true_labels, self.predictions, average='weighted')
+
+            # Debugging information
+            print(f"Number of samples: {len(self.true_labels)}")
+            print(f"Unique genders: {set(self.genders)}")
+            print(f"Gender distribution: {dict(zip(*np.unique(self.genders, return_counts=True)))}")
+
+            # Calculate gender-specific F1 scores
+            male_mask = [g == 'Male' for g in self.genders]
+            female_mask = [g == 'Female' for g in self.genders]
+
+            male_true = [l for l, m in zip(self.true_labels, male_mask) if m]
+            male_pred = [p for p, m in zip(self.predictions, male_mask) if m]
+            female_true = [l for l, m in zip(self.true_labels, female_mask) if m]
+            female_pred = [p for p, m in zip(self.predictions, female_mask) if m]
+
+            male_f1 = f1_score(male_true, male_pred, average='weighted') if male_true else np.nan
+            female_f1 = f1_score(female_true, female_pred, average='weighted') if female_true else np.nan
+
+            stats = {
+                "loss": stage_loss,
+                "error": self.error_metrics.summarize("average"),
+                "f1_score": f1,
+                "male_f1_score": male_f1,
+                "female_f1_score": female_f1,
+            }
+
+        if stage == sb.Stage.VALID:
+            old_lr, new_lr = self.hparams.lr_annealing(epoch)
+            sb.nnet.schedulers.update_learning_rate(self.optimizer, new_lr)
+
+            self.hparams.train_logger.log_stats(
+                {"Epoch": epoch, "lr": old_lr},
+                train_stats={"loss": self.train_loss},
+                valid_stats=stats,
+            )
+            self.checkpointer.save_and_keep_only(meta=stats, min_keys=["error"])
+
+        if stage == sb.Stage.TEST:
+            self.hparams.train_logger.log_stats(
+                {"Epoch loaded": self.hparams.epoch_counter.current},
+                test_stats=stats,
+            )
+            self.test_losses.append(stage_loss)
+
+        self.predictions = []
+        self.true_labels = []
+        self.genders = []
+
+    def output_predictions_test_set(self, test_set, max_key=None, min_key=None, progressbar=None, test_loader_kwargs={}):
+        if progressbar is None:
+            progressbar = not self.noprogressbar
+        if not isinstance(test_set, DataLoader):
+            test_loader_kwargs["ckpt_prefix"] = None
+            test_set = self.make_dataloader(test_set, Stage.TEST, **test_loader_kwargs)
+
+        save_file = os.path.join(self.hparams.output_folder, "predictions.csv")
+        with open(save_file, "w", newline="") as csvfile:
+            outwriter = csv.writer(csvfile, delimiter=",")
+            outwriter.writerow(["id", "prediction", "true_value", "gender"])
+
+        self.on_evaluate_start(max_key=max_key, min_key=min_key)
+        self.modules.eval()
+        with torch.no_grad():
+            for batch in tqdm(test_set, dynamic_ncols=True, disable=not progressbar):
+                self.step += 1
+                ids = batch.id
+                true_vals = batch.label_encoded.data.squeeze(dim=1).tolist()
+                genders = batch.gender
+                output = self.compute_forward(batch, stage=Stage.TEST)
+                predictions = torch.argmax(output, dim=-1).squeeze(dim=1).tolist()
+
+                for id, prediction, true_val, gender in zip(ids, predictions, true_vals, genders):
+                    with open(save_file, "a", newline="") as csvfile:
+                        outwriter = csv.writer(csvfile, delimiter=",")
+                        outwriter.writerow([id, prediction, true_val, gender])
+                    print(f"File ID: {id}, Prediction: {prediction}, True Value: {true_val}, Gender: {gender}")
+
+                if self.debug and self.step == self.debug_batches:
+                    break
+
+class Stage(Enum):
+    TRAIN = auto()
+    VALID = auto()
+    TEST = auto()
+
+def dataio_prep(hparams):
+    @sb.utils.data_pipeline.takes("wav")
+    @sb.utils.data_pipeline.provides("sig")
+    def audio_pipeline(wav):
+        # Replace the placeholder with the actual data folder path
+        wav = wav.replace("__DATA_PATH__", hparams["data_folder"])
+        try:
+            sig = sb.dataio.dataio.read_audio(wav)
+        except Exception as e:
+            print(f"Error loading audio file {wav}: {str(e)}")
+            # Return a dummy signal (1 second of silence) if the file can't be loaded
+            sig = torch.zeros(16000)
+        return sig
+
+    label_encoder = sb.dataio.encoder.CategoricalEncoder()
+
+    @sb.utils.data_pipeline.takes("label", "gender")
+    @sb.utils.data_pipeline.provides("label", "label_encoded", "gender")
+    def label_pipeline(label, gender):
+        yield label
+        label_encoded = label_encoder.encode_label_torch(label)
+        yield label_encoded
+        yield gender
+
+    datasets = {}
+    data_info = {
+        "train": hparams["train_annotation"],
+        "valid": hparams["valid_annotation"],
+        "test": hparams["test_annotation"],
+    }
+    for dataset in data_info:
+        datasets[dataset] = sb.dataio.dataset.DynamicItemDataset.from_json(
+            json_path=data_info[dataset],
+            replacements={"data_root": hparams["data_folder"]},
+            dynamic_items=[audio_pipeline, label_pipeline],
+            output_keys=["id", "sig", "label_encoded", "gender"],
+        )
+
+    lab_enc_file = os.path.join(hparams["save_folder"], "label_encoder.txt")
+    label_encoder.load_or_create(
+        path=lab_enc_file,
+        from_didatasets=[datasets["train"]],
+        output_key="label"
+    )
+
+    return datasets
+
+
+def update_test_json(json_path, new_data_path):
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+
+    for key in data:
+        data[key]['wav'] = data[key]['wav'].replace('__DATA_PATH__', new_data_path)
+
+    updated_json_path = json_path.replace('.json', '_updated.json')
+    with open(updated_json_path, 'w') as f:
+        json.dump(data, f, indent=2)
+
+    print(f"Updated JSON saved to: {updated_json_path}")
+
+if __name__ == "__main__":
+    hparams_file, run_opts, overrides = sb.parse_arguments(sys.argv[1:])
+    with open(hparams_file) as fin:
+        hparams = load_hyperpyyaml(fin, overrides)
+    #hparams['data_folder'] = os.environ.get('SLURM_TMPDIR', hparams['data_folder'])
+    sb.create_experiment_directory(
+        experiment_directory=hparams["output_folder"],
+        hyperparams_to_save=hparams_file,
+        overrides=overrides,
+    )
+
+    datasets = dataio_prep(hparams)
+
+    emo_id_brain = EmoIdBrain(
+        modules=hparams["modules"],
+        opt_class=hparams["opt_class"],
+        hparams=hparams,
+        run_opts=run_opts,
+        checkpointer=hparams["checkpointer"],
+    )
+
+    #json_path = './crosstr5val3/test.json'
+    #new_data_path = '/localscratch/hibaa.35092331.0/test'
+    #update_test_json(json_path, new_data_path)
+
+    emo_id_brain.fit(
+        epoch_counter=emo_id_brain.hparams.epoch_counter,
+        train_set=datasets["train"],
+        valid_set=datasets["valid"],
+        train_loader_kwargs=hparams["dataloader_options"],
+        valid_loader_kwargs=hparams["dataloader_options"],
+    )
+
+    emo_id_brain.evaluate(
+        test_set=datasets["test"],
+        min_key="error",
+        test_loader_kwargs=hparams["dataloader_options"],
+    )
+
+    emo_id_brain.output_predictions_test_set(
+        test_set=datasets["test"],
+        min_key="error",
+        test_loader_kwargs=hparams["dataloader_options"],
+    )
