@@ -238,7 +238,6 @@ if __name__ == "__main__":
     hparams_file, run_opts, overrides = sb.parse_arguments(sys.argv[1:])
     with open(hparams_file) as fin:
         hparams = load_hyperpyyaml(fin, overrides)
-    #hparams['data_folder'] = os.environ.get('SLURM_TMPDIR', hparams['data_folder'])
     sb.create_experiment_directory(
         experiment_directory=hparams["output_folder"],
         hyperparams_to_save=hparams_file,
@@ -254,10 +253,6 @@ if __name__ == "__main__":
         run_opts=run_opts,
         checkpointer=hparams["checkpointer"],
     )
-
-    #json_path = './crosstr5val3/test.json'
-    #new_data_path = '/localscratch/hibaa.35092331.0/test'
-    #update_test_json(json_path, new_data_path)
 
     emo_id_brain.fit(
         epoch_counter=emo_id_brain.hparams.epoch_counter,
