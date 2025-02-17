@@ -1,0 +1,116 @@
+# Seed needs to be set at top of yaml, before objects with parameters are made
+seed: 666
+__set_seed: !apply:torch.manual_seed [!ref <seed>]
+
+# Dataset folder
+data_folder: !PLACEHOLDER  # This will be replaced at runtime
+
+output_folder: !ref results3/ECAPA-TDNN/$<seed>
+save_folder: !ref <output_folder>/save
+train_log: !ref <output_folder>/train_log.txt
+
+# different speakers for train, valid and test sets
+different_speakers: False
+# which speaker is used for test set, value from 1 to 10
+test_spk_id: 1
+
+# Path where data manifest files will be stored
+train_annotation: !ref ./train.json
+valid_annotation: !ref ./valid.json
+test_annotation: !ref ./test.json
+#train_annotation: !ref ./fold_thefold3_train.json
+#valid_annotation: !ref ./fold_thefold3_valid.json
+#test_annotation: !ref ./test_data_test.json
+skip_prep: True
+
+# The train logger writes training statistics to a file, as well as stdout.
+train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
+    save_file: !ref <train_log>
+
+error_stats: !name:speechbrain.utils.metric_stats.MetricStats
+    metric: !name:speechbrain.nnet.losses.classification_error
+        reduction: batch
+
+ckpt_interval_minutes: 15 # save checkpoint every N min
+
+wavlm_hub: "microsoft/wavlm-large"
+wavlm_folder: !ref <output_folder>/wavlm
+freeze_wavlm: True
+lr_wavlm: 0.0001
+
+# Training Parameters
+number_of_epochs: 30
+batch_size: 16
+grad_accumulation_factor: 2
+lr: 0.0001
+weight_decay: 0.00002
+base_lr: 0.000001
+max_lr: !ref <lr>
+step_size: 1088
+mode: exp_range
+gamma: 0.9998
+shuffle: True
+drop_last: False
+
+# Feature parameters
+n_mels: 80
+left_frames: 0
+right_frames: 0
+deltas: False
+
+# Number of emotions
+out_n_neurons: 2 # (PD, HC)
+
+dataloader_options:
+    batch_size: !ref <batch_size>
+    shuffle: !ref <shuffle>
+    num_workers: 2
+    drop_last: !ref <drop_last>
+
+# Functions
+wavlm:
+    source: "microsoft/wavlm-large"
+
+embedding_model: !new:speechbrain.lobes.models.ECAPA_TDNN.ECAPA_TDNN
+    input_size: 1024
+    channels: [1024, 1024, 1024, 1024, 3072]
+    kernel_sizes: [5, 3, 3, 3, 1]
+    dilations: [1, 2, 3, 4, 1]
+    attention_channels: 128
+    lin_neurons: 192
+
+classifier: !new:speechbrain.lobes.models.ECAPA_TDNN.Classifier
+    input_size: 192
+    out_neurons: !ref <out_n_neurons>
+
+epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
+    limit: !ref <number_of_epochs>
+
+mean_var_norm: !new:speechbrain.processing.features.InputNormalization
+    norm_type: sentence
+    std_norm: False
+
+modules:
+    embedding_model: !ref <embedding_model>
+    classifier: !ref <classifier>
+
+compute_cost: !name:speechbrain.nnet.losses.nll_loss
+
+opt_class: !name:torch.optim.Adam
+    lr: !ref <lr>
+    weight_decay: !ref <weight_decay>
+
+lr_annealing: !new:speechbrain.nnet.schedulers.CyclicLRScheduler
+    mode: !ref <mode>
+    gamma: !ref <gamma>
+    base_lr: !ref <base_lr>
+    max_lr: !ref <max_lr>
+    step_size: !ref <step_size>
+
+checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
+    checkpoints_dir: !ref <save_folder>
+    recoverables:
+        embedding_model: !ref <embedding_model>
+        classifier: !ref <classifier>
+        normalizer: !ref <mean_var_norm>
+        counter: !ref <epoch_counter>
